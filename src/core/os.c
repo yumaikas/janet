@@ -730,7 +730,6 @@ static Janet os_execute_impl(int32_t argc, Janet *argv, int is_spawn) {
     uint64_t flags = 0;
     if (argc > 1) {
         flags = janet_getflags(argv, 1, "epx");
-
     }
 
     /* Get environment */
@@ -747,15 +746,17 @@ static Janet os_execute_impl(int32_t argc, Janet *argv, int is_spawn) {
     JanetAbstract orig_in = NULL, orig_out = NULL, orig_err = NULL;
     JanetHandle new_in = JANET_HANDLE_NONE, new_out = JANET_HANDLE_NONE, new_err = JANET_HANDLE_NONE;
     JanetHandle pipe_in = JANET_HANDLE_NONE, pipe_out = JANET_HANDLE_NONE, pipe_err = JANET_HANDLE_NONE;
+    Janet target_child_dir = janet_wrap_keyword("inherit");
     int pipe_errflag = 0; /* Track errors setting up pipes */
     int pipe_owner_flags = 0;
 
-    /* Get optional redirections */
+    /* Get spawn actions */
     if (argc > 2) {
         JanetDictView tab = janet_getdictionary(argv, 2);
         Janet maybe_stdin = janet_dictionary_get(tab.kvs, tab.cap, janet_ckeywordv("in"));
         Janet maybe_stdout = janet_dictionary_get(tab.kvs, tab.cap, janet_ckeywordv("out"));
         Janet maybe_stderr = janet_dictionary_get(tab.kvs, tab.cap, janet_ckeywordv("err"));
+        Janet maybe_chdir  = janet_dictionary_get(tab.kvs, tab.cap, janet_ckeywordv("cd"));
         if (janet_keyeq(maybe_stdin, "pipe")) {
             new_in = make_pipes(&pipe_in, 1, &pipe_errflag);
             pipe_owner_flags |= JANET_PROC_OWNS_STDIN;
@@ -773,6 +774,14 @@ static Janet os_execute_impl(int32_t argc, Janet *argv, int is_spawn) {
             pipe_owner_flags |= JANET_PROC_OWNS_STDERR;
         } else if (!janet_checktype(maybe_stderr, JANET_NIL)) {
             new_err = janet_getjstream(&maybe_stderr, 0, &orig_err);
+        }
+        /* String or buffers are ok, but don't cd to anything else, and throw errors if people try */
+        if (janet_checktype(maybe_chdir, JANET_STRING)) { 
+            target_child_dir = maybe_chdir;
+        } else if (janet_checktype(maybe_chdir, JANET_NIL)) {
+            /* do nothing, the default value has already been set */
+        } else  {
+            janet_panicf("Expected %T for os/spawn :cd env option, got %v", JANET_TFLAG_STRING| JANET_TFLAG_BUFFER,  maybe_chdir);
         }
     }
 
@@ -857,6 +866,7 @@ static Janet os_execute_impl(int32_t argc, Janet *argv, int is_spawn) {
     os_execute_cleanup(envp, NULL);
 
     if (cp_failed)  {
+        /* TODO: Get this to do better about reporting the underlying OS error */
         janet_panic("failed to create process");
     }
 
@@ -873,43 +883,117 @@ static Janet os_execute_impl(int32_t argc, Janet *argv, int is_spawn) {
      * of posix_spawn would modify the argv array passed in. */
     char *const *cargv = (char *const *)child_argv;
 
-    /* Use posix_spawn to spawn new process */
+    /* Use fork/exec to spawn new process, to be able to chdir after forking */
 
     if (use_environ) {
         janet_lock_environ();
     }
 
-    /* Posix spawn setup */
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    if (pipe_in != JANET_HANDLE_NONE) {
-        posix_spawn_file_actions_adddup2(&actions, pipe_in, 0);
-    } else if (new_in != JANET_HANDLE_NONE) {
-        posix_spawn_file_actions_adddup2(&actions, new_in, 0);
+    pid_t child_pid;
+    int pipefds[2];
+    int count, err;
+    if(pipe(pipefds)) {
+        janet_panic("Failed to create self-pipe");
     }
-    if (pipe_out != JANET_HANDLE_NONE) {
-        posix_spawn_file_actions_adddup2(&actions, pipe_out, 1);
-    } else if (new_out != JANET_HANDLE_NONE) {
-        posix_spawn_file_actions_adddup2(&actions, new_out, 1);
-    }
-    if (pipe_err != JANET_HANDLE_NONE) {
-        posix_spawn_file_actions_adddup2(&actions, pipe_err, 2);
-    } else if (new_err != JANET_HANDLE_NONE) {
-        posix_spawn_file_actions_adddup2(&actions, new_err, 2);
+    if(fcntl(pipefds[1], F_SETFD, fcntl(pipefds[1], F_GETFD) | FD_CLOEXEC)) {
+        janet_panic("Failed to set self-pipe to close on exec");
     }
 
-    pid_t pid;
-    if (janet_flag_at(flags, 1)) {
-        status = posix_spawnp(&pid,
-                              child_argv[0], &actions, NULL, cargv,
-                              use_environ ? environ : envp);
-    } else {
-        status = posix_spawn(&pid,
-                             child_argv[0], &actions, NULL, cargv,
-                             use_environ ? environ : envp);
-    }
+    switch(child_pid = fork()) {
+        case -1:
+            janet_panic("Failed to fork()");
+            break;
+        case 0:
+            close(pipefds[0]);
+            // TODO: Handle dup2 calls, and chdir here.
+            if (pipe_in != JANET_HANDLE_NONE) {
+                if(dup2(pipe_in, 0)) {
+                    fprintf(stderr, "Failed dup2 pipe_in\n");
+                    write(pipefds[1], &errno, sizeof(int));
+                    _exit(0);
+                }
+            } else if(new_in != JANET_HANDLE_NONE) {
+                if(dup2(new_in, 0)) {
+                    fprintf(stderr, "Failed dup2 new_in\n");
+                    write(pipefds[1], &errno, sizeof(int));
+                    _exit(0);
+                }
+            }
 
-    posix_spawn_file_actions_destroy(&actions);
+            if (pipe_out != JANET_HANDLE_NONE) {
+                if(dup2(pipe_out, 1)) {
+                    fprintf(stderr, "Failed dup2 pipe_out\n");
+                    write(pipefds[1], &errno, sizeof(int));
+                    _exit(0);
+                }
+            } else if(new_out != JANET_HANDLE_NONE) {
+                if(dup2(new_out, 1)) {
+                    fprintf(stderr, "Failed dup2 new_out\n");
+                    write(pipefds[1], &errno, sizeof(int));
+                    _exit(0);
+                }
+            }
+
+            if (pipe_err != JANET_HANDLE_NONE) {
+                if(dup2(pipe_err, 2)) {
+                    fprintf(stderr, "Failed dup2 pipe_err\n");
+                    write(pipefds[1], &errno, sizeof(int));
+                    _exit(0);
+                }
+            } else if(new_err != JANET_HANDLE_NONE) {
+                if(dup2(new_err, 2)) {
+                    fprintf(stderr, "Failed dup2 new_err\n");
+                    write(pipefds[1], &errno, sizeof(int));
+                    _exit(0);
+                }
+            }
+            if (!janet_keyeq(target_child_dir, "inherit")) {
+                if(janet_checktype(target_child_dir, JANET_STRING)) {
+                    const char *path = (const char *)janet_unwrap_string(target_child_dir);
+                    if(chdir(path)) {
+                        fprintf(stderr, "Failed in chdir");
+                        write(pipefds[1], &errno, sizeof(int));
+                        _exit(0);
+                    }
+                } else {
+                    int errval = ENOEXEC;
+                    /* If execution gets here, despite out attempts to keep it from doing so, 
+                     * then report an ENOEXEC error back to the caller */
+                    fprintf(stderr, "Failed in due to chdir not being right type");
+                    write(pipefds[1], &errval,  sizeof(int));
+                    _exit(0);
+                }
+            }
+            /* Check the :p flag */
+            if (janet_flag_at(flags, 1)) {
+                if(execvpe(child_argv[0], cargv, use_environ ? environ : envp)) {
+                    fprintf(stderr, "Failed after excevpe");
+                    write(pipefds[1], &errno, sizeof(int));
+                    _exit(0);
+                }
+            } else {
+                if(execve(child_argv[0], cargv, use_environ ? environ : envp)) {
+                    fprintf(stderr, "Failed after exceve");
+                    write(pipefds[1], &errno, sizeof(int));
+                    _exit(0);
+                }
+            }
+            break;
+        default:
+            close(pipefds[1]);
+            while ((count = read(pipefds[0], &err, sizeof(errno))) == -1) {
+                if (errno != EAGAIN && errno != EINTR) {break;}
+            }
+            if (count) {
+                if (err == ENOENT) {
+                    janet_panicf("Child process failed to start: %s, %s", strerror(err), child_argv[0]);
+                }
+                janet_panicf("Child process failed to start: %s", strerror(err));
+            }
+            close(pipefds[0]);
+            // Don't wait for the child process here.
+    }
+    
 
     if (pipe_in != JANET_HANDLE_NONE) close(pipe_in);
     if (pipe_out != JANET_HANDLE_NONE) close(pipe_out);
@@ -932,7 +1016,7 @@ static Janet os_execute_impl(int32_t argc, Janet *argv, int is_spawn) {
     proc->pHandle = pHandle;
     proc->tHandle = tHandle;
 #else
-    proc->pid = pid;
+    proc->pid = child_pid;
 #endif
     proc->in = NULL;
     proc->out = NULL;
